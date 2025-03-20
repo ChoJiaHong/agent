@@ -1,0 +1,8 @@
+fastapi
+grpcio
+requests
+uvicorn
+websockets
+google
+protobuf
+python-multipart
