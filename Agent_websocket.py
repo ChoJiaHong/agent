@@ -4,6 +4,7 @@ import datetime
 import json
 import logging
 import os
+import queue
 import struct
 import sys
 import threading
@@ -13,11 +14,11 @@ from fastapi import FastAPI, Form, Request
 import grpc
 import requests
 import uvicorn
-import inference_pb2
-import inference_pb2_grpc
 import websockets
 import gesture_pb2
 import gesture_pb2_grpc
+import pose_pb2
+import pose_pb2_grpc
 import base64
 
 try:
@@ -126,19 +127,27 @@ def run_http_server():
 
 
 def connect_to_service(servicename):
-    if servicename == 'object':
-        global Object_detection_channel
-        global Object_detection_stub
+    if servicename == 'pose':
+        global Pose_detection_channel
+        global Pose_detection_stub
+        global posedet_executor
 
-        if Object_detection_channel:
-            Object_detection_channel.close()
+        posedet_executor.shutdown(wait=False, cancel_futures=True)
+
+        if Pose_detection_channel:
+            Pose_detection_channel.close()
         
-        Object_detection_channel = grpc.insecure_channel(ServiceIP[1] + ":" + str(ServicePort[1]))
-        Object_detection_stub = inference_pb2_grpc.InferenceAPIsServiceStub(Object_detection_channel)
+        Pose_detection_channel = grpc.insecure_channel(ServiceIP[1] + ":" + str(ServicePort[1]))
+        Pose_detection_stub = pose_pb2_grpc.MirrorStub(Pose_detection_channel)
         logging.info(f"connected to {servicename} service, {ServiceIP[1]}:{ServicePort[1]}")
+
+        posedet_executor = futures.ThreadPoolExecutor(max_workers=30)
     elif servicename == 'gesture':
         global Gesture_detection_channel
         global Gesture_detection_stub
+        global gesturedet_executor
+
+        gesturedet_executor.shutdown(wait=False, cancel_futures=True)
 
         if Gesture_detection_channel:
             Gesture_detection_channel.close()
@@ -147,80 +156,123 @@ def connect_to_service(servicename):
         Gesture_detection_stub = gesture_pb2_grpc.GestureRecognitionStub(Gesture_detection_channel)
         logging.info(f"connected to {servicename} service, {ServiceIP[0]}:{ServicePort[0]}")
 
+        gesturedet_executor = futures.ThreadPoolExecutor(max_workers=30)
+
 def start_adjust_freq(svcidx):
     if svcidx == 0:
         threading.Thread(target=gesture_det_freq).start()
     elif svcidx == 1:
-        threading.Thread(target=object_det_freq).start()
+        threading.Thread(target=pose_det_freq).start()
 
-def object_det_freq():
-    global input_request_object
+def pose_det_callback(future):
+    try:
+        result = future.result()
+        print(result)
+    except futures.CancelledError:
+        pass
+    except grpc.RpcError as e:
+        logging.error(e)
+        # 如果需要，可以在這裡重新連線或做其他錯誤處理
+        #time.sleep(1)
+        #connect_to_service("pose")
+        #logging.info("Try to connect to Pose service again")
+
+def pose_det_freq():
+    global input_request_pose_queue
     while True:
-        if input_request_object:
-            t = time.time()
-            try:
-                feature = objectdet_executor.submit(forward_to_object_detection, input_request_object[-1])
-                print(feature.result())
-            except grpc.RpcError as e:
-                logging.error(e)
-                #time.sleep(1)
-                #connect_to_service("object")
-                #logging.info("Try to connect to Object service again")
-            input_request_object = []
-            sleeptime = 1 / Servicefreq[1] - time.time() + t
-            if sleeptime > 0:
-                time.sleep(sleeptime)
-        time.sleep(0.001)
+        try:
+            # blocking 取得一筆請求
+            request = input_request_pose_queue.get(timeout=1/Servicefreq[1])
+            # 如果 queue 中還有其他請求，取出最新的那一筆（丟棄前面的資料）
+            while not input_request_pose_queue.empty():
+                request = input_request_pose_queue.get_nowait()
+        except queue.Empty:
+            # 若超時沒拿到資料，直接進入下一輪迴圈
+            continue
+
+        t = time.time()
+        try:
+            future = posedet_executor.submit(forward_to_pose_detection, request)
+            future.add_done_callback(pose_det_callback)
+        except:
+            logging.error("threadpool shutting down")
+        # 根據目標頻率進行睡眠控制
+        sleeptime = 1 / Servicefreq[1] - (time.time() - t)
+        if sleeptime > 0:
+            time.sleep(sleeptime)
+        else:
+            print(f"pose sleep time = {sleeptime}")
+            logging.info(f"pose sleep time = {sleeptime}")
 
             
-def forward_to_object_detection(request):
-        global object_sendFPS
-        global object_resultFPS
-        req = inference_pb2.PredictionsRequest(
-            model_name='models-1',
-            input={'data': request[:-4]}
+def forward_to_pose_detection(request):
+        global pose_sendFPS
+        global pose_resultFPS
+        global pose_timeout
+
+        req = pose_pb2.FrameRequest(
+            image_data=request[:-4]
         )
         #send[struct.unpack('i', request[-4:])[0]] = datetime.datetime.now().strftime("%H_%M_%S_%f")[:-3]
-        object_sendFPS += 1
+        pose_sendFPS += 1
         try:
             t = time.time()
-            response = Object_detection_stub.Predictions(req)
-            #logging.info(f"object detection inference time = {time.time() - t}")
+            response = Pose_detection_stub.SkeletonFrame(req, timeout=pose_timeout)
+            logging.info(f"pose detection inference time = {time.time() - t}")
         except Exception as e:
             logging.error(e)
             raise grpc.RpcError("gRPC transmission failed")
-        object_resultFPS += 1
+        pose_resultFPS += 1
         #get[struct.unpack('i', request[-4:])[0]] = datetime.datetime.now().strftime("%H_%M_%S_%f")[:-3]
-        result = response.prediction.decode('utf-8')
-        result = json.loads(result)
-        retstr = ""
-        for i in range(0, 5):
-            retstr = retstr + result[0]['parts'][i] + " "
+
+        retstr = response.skeletons
         retstr += f"{struct.unpack('i', request[-4:])[0]:04}" + " "
         responses.append(retstr[0:-1])
 
+def gesture_det_callback(future):
+    try:
+        result = future.result()
+        print(result)
+    except futures.CancelledError:
+        pass
+    except grpc.RpcError as e:
+        logging.error(e)
+        # 若需要，可在此處理重新連線或其他錯誤處理
+        #time.sleep(1)
+        #connect_to_service("gesture")
+        #logging.info("Try to connect to Gesture service again")
+
 def gesture_det_freq():
-    global input_request_gesture
+    global input_request_gesture_queue
     while True:
-        if input_request_gesture:
-            t = time.time()
-            try:
-                feature = gesturedet_executor.submit(forward_to_gesture_detection, input_request_gesture[-1])
-                print(feature.result())
-            except grpc.RpcError as e:
-                logging.error(e)
-                #time.sleep(1)
-                #connect_to_service("gesture")
-                #logging.info("Try to connect to Gesture service again")
-            input_request_gesture = []
-            sleeptime = 1 / Servicefreq[0] - time.time() + t
-            if sleeptime > 0:
-                time.sleep(sleeptime)
-        time.sleep(0.001)
+        try:
+            # blocking 取得一筆請求
+            request = input_request_gesture_queue.get(timeout=1/Servicefreq[0])
+            # 如果 queue 中還有其他請求，取出最新的那一筆（丟棄前面的資料）
+            while not input_request_gesture_queue.empty():
+                request = input_request_gesture_queue.get_nowait()
+        except queue.Empty:
+            # 若超時沒拿到資料，直接進入下一輪迴圈
+            continue
+
+        t = time.time()
+        try:
+            future = gesturedet_executor.submit(forward_to_gesture_detection, request)
+            future.add_done_callback(gesture_det_callback)
+        except:
+            logging.error("threadpool shutting down")
+        # 根據目標頻率進行睡眠控制
+        sleeptime = 1 / Servicefreq[0] - (time.time() - t)
+        if sleeptime > 0:
+            time.sleep(sleeptime)
+        else:
+            print(f"gesture sleep time = {sleeptime}")
+            logging.info(f"gesture sleep time = {sleeptime}")
 
 def forward_to_gesture_detection(request):
         global gesture_sendFPS
         global gesture_resultFPS
+        global gesture_timeout
         req = gesture_pb2.RecognitionRequest(
             image = base64.b64encode(request[:-4])
         )
@@ -228,8 +280,8 @@ def forward_to_gesture_detection(request):
         gesture_sendFPS += 1
         try:
             t = time.time()
-            response = Gesture_detection_stub.Recognition(req)
-            #logging.info(f"gesture detection inference time = {time.time() - t}")
+            response = Gesture_detection_stub.Recognition(req, timeout=gesture_timeout)
+            logging.info(f"gesture detection inference time = {time.time() - t}")
         except Exception as e:
             logging.error(e)
             raise grpc.RpcError("gRPC transmission failed")
@@ -243,17 +295,18 @@ def forward_to_gesture_detection(request):
 
 def counting_FPS():
     global recvFPS
-    global object_sendFPS
-    global object_resultFPS
+    global pose_sendFPS
+    global pose_resultFPS
     global gesture_sendFPS
     global gesture_resultFPS
     global returnFPS
     while True:
-        if not (recvFPS == 0 and object_sendFPS == 0 and object_resultFPS == 0 and returnFPS == 0):
-            logging.info(f"FPS: [receive from AR: {recvFPS}, send to object service: {object_sendFPS}, get object result: {object_resultFPS}, send to gesture service: {gesture_sendFPS}, get gesture result: {gesture_resultFPS}, return to AR: {returnFPS}]")
+        t=time.time()
+        if not (recvFPS == 0 and pose_sendFPS == 0 and pose_resultFPS == 0 and returnFPS == 0):
+            logging.info(f"FPS: [receive from AR: {recvFPS}, send to pose service: {pose_sendFPS}, get pose result: {pose_resultFPS}, send to gesture service: {gesture_sendFPS}, get gesture result: {gesture_resultFPS}, return to AR: {returnFPS}]")
         recvFPS = 0
-        object_sendFPS = 0
-        object_resultFPS = 0
+        pose_sendFPS = 0
+        pose_resultFPS = 0
         gesture_sendFPS = 0
         gesture_resultFPS = 0
         returnFPS = 0
@@ -278,14 +331,16 @@ async def receive_messages(websocket):
     global recvFPS
     try:
         async for message in websocket:
-            print(f"received {len(message)}")
+            #print(f"received {len(message)}")
             recvFPS += 1
             #print(f"Received message: {message}")
             # 可以在這裡處理接收到的消息，例如存儲或進行某些操作
-            print(struct.unpack('i', message[-4:])[0])
+            #print(struct.unpack('i', message[-4:])[0])
             #recv[struct.unpack('i', message[-4:])[0]] = datetime.datetime.now().strftime("%H_%M_%S_%f")[:-3]
-            input_request_object.append(message)
-            input_request_gesture.append(message)
+
+            input_request_pose_queue.put(message)
+            input_request_gesture_queue.put(message)
+
     except Exception as e:
         print("Exception while receiving")
         print(e)
@@ -312,40 +367,46 @@ async def send_messages(websocket):
 
 Services = {
     'gesture' : 0,
-    'object' : 1
+    'pose' : 1
 }
 ServiceIP = ["", ""]
 ServicePort = [0, 0]
 Servicefreq = [0, 0]
 hasGotService = [False, False]
 
-input_request_object = []
-input_request_gesture = []
+input_request_pose_queue = queue.Queue()
+input_request_gesture_queue = queue.Queue()
 responses = []
 
-Object_detection_channel = None
-Object_detection_stub = None
+Pose_detection_channel = None
+Pose_detection_stub = None
 Gesture_detection_channel = None
 Gesture_detection_stub = None
 
-objectdet_executor = futures.ThreadPoolExecutor(max_workers=30)
+posedet_executor = futures.ThreadPoolExecutor(max_workers=30)
 gesturedet_executor = futures.ThreadPoolExecutor(max_workers=30)
+
+pose_lowest_FPS = 10
+gesture_lowest_FPS = 15
+
+pose_timeout = 1 / pose_lowest_FPS + 0.008           # 0.008 is network average transfer latency plus std_dev
+gesture_timeout = 1 / gesture_lowest_FPS + 0.008     # 0.008 is network average transfer latency plus std_dev
 
 try:
     if sys.argv[4] != "" and int(sys.argv[5]) != 0:
         ServiceIP[1] = sys.argv[4]
         ServicePort[1] = int(sys.argv[5])
-        Servicefreq[1] = float(sys.argv[6])
-        logging.info(f"Try to connect to Object service, IP = {ServiceIP[1]}, Port = {ServicePort[1]}, Freq = {Servicefreq[1]}")
+        Servicefreq[1] = round(float(sys.argv[6]), 5)
+        logging.info(f"Try to connect to Pose service, IP = {ServiceIP[1]}, Port = {ServicePort[1]}, Freq = {Servicefreq[1]}")
         hasGotService[1] = True
-        connect_to_service("object")
+        connect_to_service("pose")
         start_adjust_freq(1)
     else:
-        logging.info("no Object service subscribed")
+        logging.info("no Pose service subscribed")
     if sys.argv[7] != "" and int(sys.argv[8]) != 0:
         ServiceIP[0] = sys.argv[7]
         ServicePort[0] = int(sys.argv[8])
-        Servicefreq[0] = float(sys.argv[9])
+        Servicefreq[0] = round(float(sys.argv[9]), 5)
         logging.info(f"Try to connect to Gesture service, IP = {ServiceIP[0]}, Port = {ServicePort[0]}, Freq = {Servicefreq[0]}")
         hasGotService[0] = True
         connect_to_service("gesture")
@@ -363,9 +424,22 @@ ControllerIP = '10.52.52.126'
 ControllerPort = 30004
 
 recvFPS = 0
-object_sendFPS = 0
-object_resultFPS = 0
+pose_sendFPS = 0
+pose_resultFPS = 0
 returnFPS = 0
+
+# 啟動 WebSocket 伺服器
+async def start_server():
+    try:
+        websocket_server = await websockets.serve(handle_connection, AgentIP, AgentWebsocketPort)
+
+        print(f"WebSocket server started on ws://{AgentIP}:{AgentWebsocketPort}")
+        logging.info(f"WebSocket server started on ws://{AgentIP}:{AgentWebsocketPort}")
+        
+        await websocket_server.wait_closed()
+        
+    except Exception as e:
+        logging.error(f"Failed to start WebSocket server: {e}")
 
 if __name__ == '__main__':
     print("start")
@@ -383,14 +457,7 @@ if __name__ == '__main__':
     # 啟動WebSocket伺服器
     try:
         
-        websocket_server = websockets.serve(handle_connection, AgentIP, AgentWebsocketPort)
-
-        #loop = asyncio.new_event_loop()
-        #asyncio.set_event_loop(loop)
-
-        print(f"WebSocket server started on ws://{AgentIP}:{AgentWebsocketPort}")
-        logging.info(f"WebSocket server started on ws://{AgentIP_outside}:{AgentWebsocketPort}")
-        asyncio.get_event_loop().run_until_complete(websocket_server)
+        asyncio.run(start_server())  # 啟動協程
         
     except Exception as e:
         logging.error(f"Failed to start WebSocket server: {e}")
