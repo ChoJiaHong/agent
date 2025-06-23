@@ -59,6 +59,7 @@ async def log_requests(request: Request, call_next):
 
 @app.post("/subscribe")
 async def subscribe(servicename: Annotated[str, Form()]):
+    logging.info(f"subscribe service {servicename}")
     response = requests.post(f'http://{ControllerIP}:{ControllerPort}/subscribe', {"ip": AgentIP_outside, "port": AgentPort, "serviceType": servicename})
     response = response.json()
 
@@ -83,6 +84,7 @@ async def subscribe(servicename: Annotated[str, Form()]):
 @app.post("/servicechange")
 async def service(request: Request):
     data = await request.json()
+    logging.info(f"service change request: {data}")
     servicename = data["servicename"]
     ip = data["ip"]
     port = data["port"]
@@ -105,6 +107,7 @@ async def service(request: Request):
 
 @app.delete("/subscribe")
 async def unsubscribe():
+    logging.info("unsubscribe all services")
     for service in Services:
         svcidx = Services[service]
         ServiceIP[svcidx] = ""
@@ -159,6 +162,7 @@ def connect_to_service(servicename):
         gesturedet_executor = futures.ThreadPoolExecutor(max_workers=30)
 
 def start_adjust_freq(svcidx):
+    logging.info(f"start adjust freq thread for svcidx {svcidx}")
     if svcidx == 0:
         threading.Thread(target=gesture_det_freq).start()
     elif svcidx == 1:
@@ -179,6 +183,7 @@ def pose_det_callback(future):
 
 def pose_det_freq():
     global input_request_pose_queue
+    logging.info("pose_det_freq thread started")
     while True:
         try:
             # blocking 取得一筆請求
@@ -209,6 +214,8 @@ def forward_to_pose_detection(request):
         global pose_sendFPS
         global pose_resultFPS
         global pose_timeout
+
+        logging.info("send frame to pose detection")
 
         req = pose_pb2.FrameRequest(
             image_data=request[:-4]
@@ -244,6 +251,7 @@ def gesture_det_callback(future):
 
 def gesture_det_freq():
     global input_request_gesture_queue
+    logging.info("gesture_det_freq thread started")
     while True:
         try:
             # blocking 取得一筆請求
@@ -273,6 +281,7 @@ def forward_to_gesture_detection(request):
         global gesture_sendFPS
         global gesture_resultFPS
         global gesture_timeout
+        logging.info("send frame to gesture detection")
         req = gesture_pb2.RecognitionRequest(
             image = base64.b64encode(request[:-4])
         )
@@ -317,6 +326,8 @@ async def handle_connection(websocket, path):
     client_ip, client_port = websocket.remote_address
     logging.info(f"WebSocket Client connected from {client_ip}:{client_port}")
 
+    logging.info("start handle_connection")
+
     threading.Thread(target = counting_FPS).start()
     #start_adjust_freq(1)
     
@@ -324,7 +335,7 @@ async def handle_connection(websocket, path):
     send_task = asyncio.create_task(send_messages(websocket))
 
     await asyncio.gather(receive_task, send_task)
-
+    logging.info("client disconnected")
     print("Client disconnected")
 
 async def receive_messages(websocket):
@@ -333,6 +344,7 @@ async def receive_messages(websocket):
         async for message in websocket:
             #print(f"received {len(message)}")
             recvFPS += 1
+            logging.info(f"receive {len(message)} bytes from websocket")
             #print(f"Received message: {message}")
             # 可以在這裡處理接收到的消息，例如存儲或進行某些操作
             #print(struct.unpack('i', message[-4:])[0])
@@ -357,6 +369,7 @@ async def send_messages(websocket):
                 
                 returnFPS += 1
                 await websocket.send(responses[0].encode('utf-8'))
+                logging.info("send result to client")
                 responses.pop(0)
             await asyncio.sleep(0.001)
     except Exception as e:
@@ -431,18 +444,21 @@ returnFPS = 0
 # 啟動 WebSocket 伺服器
 async def start_server():
     try:
+        logging.info("starting websocket server")
         websocket_server = await websockets.serve(handle_connection, AgentIP, AgentWebsocketPort)
 
         print(f"WebSocket server started on ws://{AgentIP}:{AgentWebsocketPort}")
         logging.info(f"WebSocket server started on ws://{AgentIP}:{AgentWebsocketPort}")
         
         await websocket_server.wait_closed()
+        logging.info("websocket server closed")
         
     except Exception as e:
         logging.error(f"Failed to start WebSocket server: {e}")
 
 if __name__ == '__main__':
     print("start")
+    logging.info("agent start")
 
     app.debug = False
     threading.Thread(target = run_http_server).start()
